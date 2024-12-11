@@ -1,0 +1,342 @@
+---
+title: "Final Report"
+author: "Duc Nguyen"
+date: "2024-11-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## House Sales in King County, USA
+
+#### Load the dataset
+```{r}
+library(readxl)
+data <- read.csv("D:/UCF Grad/Data Preparation/kc_house_data.csv")
+```
+
+#### Load libraries
+```{r}
+library(dplyr)
+library(tidyr)
+library(caret)
+library(corrplot)
+library(leaflet)
+
+
+```
+
+#### EDA
+
+```{r}
+head(data)
+```
+
+```{r}
+summary(data)
+```
+```{r}
+# Drop id, date columns
+data <- data %>% select(-id)
+data <- data %>% select(-date)
+
+```
+```{r}
+data <- data %>% drop_na()  # Removes rows with any NA values
+data <- data %>% distinct() # Remove duplicate rows
+
+```
+
+```{r}
+# Compute the correlation matrix
+cor_matrix <- cor(data)
+
+# Plot the correlation heatmap
+corrplot(cor_matrix, method = "color", col = colorRampPalette(c("blue", "white", "red"))(200), 
+         tl.col = "black", tl.cex = 0.8)
+```
+
+The features sqft_living, sqft_above, grade, and sqft_living15 show the strongest positive correlations with price. This indicates that as these features increase, the house price tends to increase as well.
+
+```{r}
+par(mfrow=c(2, 3))  # Arrange plots in a 2x3 grid
+for (col in names(data)) {
+  hist(data[[col]], main=paste("Histogram of", col), xlab=col, col="lightblue")
+}
+```
+
+During the EDA, I found that the target variable, `price`, was highly right-skewed due to outliers. To prevent these outliers from affecting model performance, I decided to remove rows containing extreme values in the target variable.
+
+
+#### Data Preprocessing
+
+```{r}
+# Calculate the IQR for the price column
+Q1 <- quantile(data$price, 0.25, na.rm = TRUE)
+Q3 <- quantile(data$price, 0.75, na.rm = TRUE)
+IQR_value <- Q3 - Q1
+
+# Define the lower and upper bounds for outliers
+lower_bound <- Q1 - 1.5 * IQR_value
+upper_bound <- Q3 + 1.5 * IQR_value
+
+# Remove rows where the price is outside of the bounds
+clean_data <- data[data$price >= lower_bound & data$price <= upper_bound, ]
+```
+Outliers can distort model training, especially for algorithms like k-NN, which are sensitive to data scale. By removing them, the model can better focus on typical data points and avoid overfitting.
+
+
+```{r}
+par(mfrow=c(2, 3))  # Arrange plots in a 2x3 grid
+for (col in names(clean_data)) {
+  hist(clean_data[[col]], main=paste("Histogram of", col), xlab=col, col="lightblue")
+}
+```
+
+After removing the outliers in the target variable (price), the distribution became more centered, indicating a more normal-like spread of values.
+
+### Data Preparation
+```{r}
+set.seed(123)
+
+# Due to technical issue, I had to narrow down the dataset to 5000 rows so my laptop can run it 
+subset_data <- clean_data[sample(nrow(clean_data), 5000), ]
+```
+
+```{r}
+set.seed(123)
+idx <- createDataPartition(subset_data$price, p = 0.7, list = FALSE)
+train.df <- subset_data[idx, ]
+test.df <- subset_data[-idx, ]
+```
+
+
+### Model Implementation and Evaluation
+
+#### KNN
+
+```{r}
+set.seed(123)
+preproc <- preProcess(train.df[,-1], method = c("center", "scale"))
+train_scaled <- predict(preproc, train.df[,-1])
+test_scaled <- predict(preproc, test.df[,-1])
+train_scaled <- bind_cols(price = train.df$price, train_scaled)
+test_scaled <- bind_cols(price = test.df$price, test_scaled)
+trControl <- trainControl(method = "repeatedcv", number = 5, repeats = 3)
+model <- train(price ~., data=train_scaled,method="knn",preProcess=c("center", "scale"),tuneGrid=expand.grid(k=seq(1, 20, 1)),trControl=trControl)
+model
+
+```
+
+```{r}
+plot(model)
+```
+
+Based on the results, k=7 yields the lowest RMSE, indicating the best performance for this dataset. 
+
+```{r}
+set.seed(123)
+final_knn_model <- train(
+  price ~ ., 
+  data = train_scaled, 
+  method = "knn", 
+  tuneGrid = expand.grid(k = 7),  # Choose the optimal k from the results
+  preProcess = c("center", "scale"),
+  trControl = trainControl(method = "cv", number = 5)
+)
+
+```
+
+```{r}
+# Make predictions on the test set
+knn_predictions <- predict(final_knn_model, newdata = test_scaled)
+
+# Calculate RMSE for the test set
+knn_rmse <- sqrt(mean((knn_predictions - test.df$price)^2))
+knn_rmse
+```
+
+```{r}
+# Calculate the absolute error for each prediction
+test.df <- test.df %>%
+  mutate(knn_error = abs(knn_predictions - price))  # Absolute error
+
+# Define a color palette for the KNN error magnitude
+knn_palette <- colorNumeric(palette = "YlOrRd", domain = test.df$knn_error)
+
+# Create a leaflet map to visualize the KNN error
+leaflet(test.df) %>%
+  addProviderTiles(providers$OpenStreetMap) %>%  # Using OpenStreetMap as base map
+  addCircleMarkers(
+    ~long, ~lat,  # Longitude and Latitude columns
+    color = ~knn_palette(knn_error),  # Color based on the error
+    label = ~paste("Actual Price: $", price, 
+                   "<br>Predicted Price: $", round(knn_predictions, 2), 
+                   "<br>Error: $", round(knn_error, 2)),  # Display information in popups
+    opacity = 0.8,
+    radius = 4  # Marker size
+  ) %>%
+  addLegend("bottomright", 
+            pal = knn_palette, 
+            values = ~knn_error, 
+            title = "KNN Prediction Error")  # Legend showing error scale
+```
+
+High Error Hotspots: Dark red areas show regions with high prediction errors, suggesting the model struggles in those locations. These could be due to local features not captured by the model, or complex trends in those areas.
+
+Geographical Patterns: Coastal areas and regions around Seattle exhibit higher errors, suggesting the model struggles to capture trends specific to these high-value, waterfront properties. The rarity of waterfront = 1 (waterfront = 1 represents only ~0.75% of the data) could make it difficult for the model to differentiate these properties from others.
+
+Opportunities for Improvement: The model performs better in yellow/light orange regions. Focusing on high-error areas for feature refinement could help improve predictions.
+
+
+#### Ensemble Models
+
+##### Random Forest
+
+
+```{r}
+library(randomForest)
+```
+
+```{r}
+set.seed(123)
+rf_model <- train(
+  price ~ ., 
+  data = train.df,
+  method = "rf",
+  tuneGrid = data.frame(mtry = floor((ncol(train.df)-1)/ 3)), #not include target variable
+  trControl = trainControl(method = "cv", number = 5) # 5-fold cross-validation 
+)
+predictions <- predict(rf_model, newdata = test.df)
+
+rf_rmse <- sqrt(mean((predictions - test.df$price)^2))  # RMSE calculation
+rf_rmse
+```
+
+##### Bagging
+
+```{r}
+set.seed(123)
+bagged_model <- train(
+  price ~ ., 
+  data = train.df,
+  method = "treebag",
+  trControl = trainControl(method = "cv", number = 5) # 5-fold cross-validation 
+)
+# Make predictions on the test set
+bagging_predictions <- predict(bagged_model, newdata = test.df)
+
+# Calculate RMSE
+bagging_rmse <- sqrt(mean((bagging_predictions - test.df$price)^2))
+bagging_rmse
+```
+
+```{r}
+# Load the package
+library(gbm)
+```
+
+##### Boosting
+```{r}
+set.seed(123)
+gbm_model <- train(
+   price ~ ., 
+  data = train.df,
+  method = "gbm",
+  verbose = FALSE,
+  trControl = trainControl(method = "cv", number = 5)  # 5-fold cross-validation 
+)
+# Make predictions on the test set
+gbm_predictions <- predict(gbm_model, newdata = test.df)
+
+# Calculate RMSE
+gbm_rmse <- sqrt(mean((gbm_predictions - test.df$price)^2))
+gbm_rmse
+```
+
+#### Variable Selection:
+
+To identify significant features for predicting house prices, I used feature importance metrics derived from Bagging, Random Forest, and Boosting models. These methods rank variables based on their contribution to the model's predictive performance.
+
+```{r}
+library(vip)
+
+```
+
+```{r}
+print(varImp(bagged_model))
+```
+
+
+```{r}
+# Random Forest feature importance
+rf_importance <- vip(rf_model, num_features = 10)
+
+# Gradient Boosting feature importance
+gbm_importance <- vip(gbm_model, num_features = 10)
+
+
+# Display importance
+rf_importance
+gbm_importance
+```
+
+Consistent features: Across all models, lat, sqft_living, grade, and sqft_living15 were repeatedly identified as top predictors, indicating their strong relationship with house prices.
+
+
+#### Comparison of Methods
+
+The models were evaluated using RMSE (Root Mean Squared Error) on the test set. Lower RMSE values indicate better performance.
+
+```{r}
+rmse_df <- data.frame(
+  Method = c("Bagging", "Random Forests", "Gradient Boosting","KNN"),
+  RMSE = c(bagging_rmse, rf_rmse, gbm_rmse,knn_rmse)
+)
+
+ggplot(rmse_df, aes(x = Method, y = RMSE, fill = Method)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Comparison of RMSE Across Methods", x = "Method", y = "RMSE") +
+  theme_minimal()
+```
+
+Random Forests and Gradient Boosting offer the best predictive accuracy, making them more suitable for predicting house prices in this case.
+
+#### Model Interpretation and Comparison 
+
+##### Model Comparison
+
+1. KNN (k-Nearest Neighbors):
+
+- Strengths: Simple, non-parametric (meaning no assumptions about the underlying data distribution), works well for smaller datasets.
+
+- Weaknesses: Computationally expensive for large datasets, sensitive to irrelevant features and outliers.
+
+Performance: RMSE showing decent accuracy but not as good as ensemble models.
+
+2. Ensemble Models (Random Forest, Bagging, Gradient Boosting):
+
+- Strengths:
+
+  + Random Forests: Provides an average of many decision trees to reduce overfitting and improve generalization. It's robust to overfitting and works well for both regression and classification problems.
+
+  + Bagging: Uses multiple models (decision trees) to create an aggregate prediction, reducing variance but can still suffer from overfitting if the base models are too complex.
+
+  + Gradient Boosting: Uses boosting to iteratively correct the errors of weaker models, making it highly effective in terms of predictive power. It is usually the most accurate of the tree-based models but can be prone to overfitting if not tuned properly.
+
+- Weaknesses:
+
+  + Random Forests and Bagging: While they handle large datasets and high-dimensional spaces well, they may still require a lot of computational resources, especially if the dataset is very large.
+
+  + Gradient Boosting: More computationally expensive and sensitive to hyperparameter tuning. It can overfit if not carefully optimized.
+
+Performance: Random Forest and Gradient Boosting outperformed KNN, showing better accuracy.
+
+##### Interpretation and Discussion
+
+Clustering in KNN: KNN works by finding the closest neighbors to a data point, which essentially means grouping similar data points together. This clustering approach is useful in many scenarios but may not always capture the complex relationships between features in high-dimensional data. In this case, KNN did not perform as well as the ensemble models, indicating that clustering alone was insufficient for capturing the complexities of predicting house prices.
+
+Prediction Accuracy: Ensemble models, particularly Random Forests and Gradient Boosting, performed better in terms of RMSE, showing that they are more effective for predictive modeling tasks involving multiple complex features like those in the house price dataset. These models benefit from their ability to combine predictions from multiple trees, which improves overall accuracy.
+
